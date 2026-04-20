@@ -29,3 +29,6 @@
 2026-04-20 11:54:50,187 [m7a_runner] INFO launching M7A: D:\2_Software\4_Games\StarRail\Auto\March7thAssistant_full\March7th Launcher.exe main -e
 2026-04-20 11:54:50,212 [m7a_runner] INFO M7A started (pid=20984)
 2026-04-20 11:54:50,212 [m7a_runner] INFO watchdog started: timeout=900s, grace=60s
+2026-04-20 12:05:09,233 [m7a_runner] WARNING M7A log not updated for 600s, killing
+2026-04-20 12:05:09,241 [m7a_runner] INFO killed process tree (pid=20984, children=0)
+2026-04-20 12:05:09,241 [m7a_runner] INFO === finished with code 1 ===

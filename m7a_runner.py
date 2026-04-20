@@ -1,6 +1,7 @@
 """核心执行器 — UU 加速 + M7A 启动 + 看门狗监控."""
 
 import argparse
+import ctypes
 import logging
 import subprocess
 import sys
@@ -27,12 +28,27 @@ CPU_IDLE_THRESHOLD = 2.0   # CPU 使用率阈值（%）
 CPU_IDLE_WINDOW = 900      # CPU 空闲持续时间（秒）= 15 分钟
 LOG_HEARTBEAT_TIMEOUT = 600  # 日志无更新超时（秒）= 10 分钟
 WATCHDOG_INTERVAL = 30     # 看门狗检查间隔（秒）
+GAME_READY_TIMEOUT = 120   # 游戏启动确认超时（秒）
+GAME_READY_INTERVAL = 2    # 游戏启动确认轮询间隔（秒）
 
 # 默认超时
 DEFAULT_TIMEOUTS = {
     "universe": 7200,
     "main": 1800,
 }
+
+GAME_PROCESS_NAMES = {"starrail.exe"}
+GAME_WINDOW_KEYWORDS = ("崩坏：星穹铁道",)
+
+# 统一退出码
+EXIT_OK = 0
+EXIT_UU_FAILED = 10
+EXIT_M7A_LAUNCH_FAILED = 20
+EXIT_GAME_READY_TIMEOUT = 21
+EXIT_M7A_EXIT_NONZERO = 22
+EXIT_WATCHDOG_HARD_TIMEOUT = 30
+EXIT_WATCHDOG_CPU_IDLE = 31
+EXIT_WATCHDOG_LOG_STALLED = 32
 
 log = logging.getLogger("m7a_runner")
 
@@ -81,8 +97,73 @@ def _kill_process_tree(pid: int) -> None:
         log.info("process %d already exited", pid)
 
 
+def _iter_visible_window_titles() -> list[str]:
+    """枚举当前桌面的可见窗口标题。"""
+    titles: list[str] = []
+
+    @ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_void_p, ctypes.c_void_p)
+    def enum_windows_proc(hwnd: int, lparam: int) -> bool:
+        if not ctypes.windll.user32.IsWindowVisible(hwnd):
+            return True
+
+        length = ctypes.windll.user32.GetWindowTextLengthW(hwnd)
+        if length <= 0:
+            return True
+
+        buffer = ctypes.create_unicode_buffer(length + 1)
+        ctypes.windll.user32.GetWindowTextW(hwnd, buffer, len(buffer))
+        title = buffer.value.strip()
+        if title:
+            titles.append(title)
+        return True
+
+    ctypes.windll.user32.EnumWindows(enum_windows_proc, 0)
+    return titles
+
+
+def _is_game_process_running() -> bool:
+    """检查游戏进程是否已出现。"""
+    for proc in psutil.process_iter(["name"]):
+        name = (proc.info["name"] or "").casefold()
+        if name in GAME_PROCESS_NAMES:
+            return True
+    return False
+
+
+def _is_game_window_present() -> bool:
+    """检查游戏窗口是否已出现。"""
+    for title in _iter_visible_window_titles():
+        lowered = title.casefold()
+        if any(keyword.casefold() in lowered for keyword in GAME_WINDOW_KEYWORDS):
+            return True
+    return False
+
+
+def _wait_for_game_ready(timeout: int = GAME_READY_TIMEOUT) -> bool:
+    """等待游戏进程或窗口出现，确认链路已真正拉起游戏。"""
+    deadline = time.monotonic() + timeout
+
+    log.info(
+        "waiting up to %ds for game process/window to appear",
+        timeout,
+    )
+    while time.monotonic() < deadline:
+        process_ready = _is_game_process_running()
+        window_ready = _is_game_window_present()
+        if process_ready or window_ready:
+            log.info(
+                "game detected: process=%s, window=%s",
+                process_ready,
+                window_ready,
+            )
+            return True
+        time.sleep(GAME_READY_INTERVAL)
+
+    return False
+
+
 def _watchdog(proc: subprocess.Popen, timeout: int) -> int:
-    """看门狗监控 M7A 进程。返回退出码（0=正常, 1=异常）."""
+    """看门狗监控 M7A 进程。返回统一退出码。"""
     start_time = time.monotonic()
     cpu_idle_since: float | None = None
 
@@ -93,7 +174,7 @@ def _watchdog(proc: subprocess.Popen, timeout: int) -> int:
         ret = proc.poll()
         if ret is not None:
             log.info("M7A exited with code %d", ret)
-            return 0 if ret == 0 else 1
+            return EXIT_OK if ret == 0 else EXIT_M7A_EXIT_NONZERO
 
         elapsed = time.monotonic() - start_time
         in_grace = elapsed < GRACE_PERIOD
@@ -102,7 +183,7 @@ def _watchdog(proc: subprocess.Popen, timeout: int) -> int:
         if elapsed >= timeout:
             log.warning("HARD TIMEOUT reached (%ds), killing", timeout)
             _kill_process_tree(proc.pid)
-            return 1
+            return EXIT_WATCHDOG_HARD_TIMEOUT
 
         if not in_grace:
             # CPU 空闲检测
@@ -118,7 +199,7 @@ def _watchdog(proc: subprocess.Popen, timeout: int) -> int:
                             CPU_IDLE_WINDOW, CPU_IDLE_THRESHOLD,
                         )
                         _kill_process_tree(proc.pid)
-                        return 1
+                        return EXIT_WATCHDOG_CPU_IDLE
                 else:
                     cpu_idle_since = None
             except psutil.NoSuchProcess:
@@ -134,7 +215,7 @@ def _watchdog(proc: subprocess.Popen, timeout: int) -> int:
                         LOG_HEARTBEAT_TIMEOUT,
                     )
                     _kill_process_tree(proc.pid)
-                    return 1
+                    return EXIT_WATCHDOG_LOG_STALLED
 
         time.sleep(WATCHDOG_INTERVAL)
 
@@ -150,7 +231,7 @@ def run(task: str, timeout: int) -> int:
         ensure_uu_connected()
     except RuntimeError as e:
         log.error("UU acceleration failed: %s", e)
-        return 1
+        return EXIT_UU_FAILED
 
     # 2. 启动 M7A
     # 当前版本实测需要走 Launcher.exe 才能正确接收任务参数并启动游戏
@@ -158,10 +239,20 @@ def run(task: str, timeout: int) -> int:
     exe = M7A_LAUNCHER
     cmd = [str(exe), task, "-e"]
     log.info("launching M7A: %s", " ".join(cmd))
-    proc = subprocess.Popen(cmd)
+    try:
+        proc = subprocess.Popen(cmd)
+    except OSError as exc:
+        log.error("failed to launch M7A: %s", exc)
+        return EXIT_M7A_LAUNCH_FAILED
     log.info("M7A started (pid=%d)", proc.pid)
 
-    # 3. 看门狗监控
+    # 3. 启动成功判定：游戏必须真的被拉起
+    if not _wait_for_game_ready():
+        log.error("game was not detected within %ds", GAME_READY_TIMEOUT)
+        _kill_process_tree(proc.pid)
+        return EXIT_GAME_READY_TIMEOUT
+
+    # 4. 看门狗监控
     return _watchdog(proc, timeout)
 
 

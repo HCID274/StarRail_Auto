@@ -32,6 +32,7 @@ IMAGE_CONFIDENCE = 0.8
 STEP_1_INITIAL_DELAY = 3.0
 STEP_1_TIMEOUT = 10.0
 STEP_2_TIMEOUT = 5.0
+REUSE_CONFIRM_TIMEOUT = 3.0
 POST_MOVE_DELAY = 0.5
 POST_CLICK_WAIT = 20         # 点击后等待确认的时间（秒）
 CONFIRM_TIMEOUT = 30         # 确认图片搜索超时（秒）
@@ -242,6 +243,30 @@ def _locate_image(
     raise RuntimeError(f"cannot locate template: {template}")
 
 
+def _try_locate_image(
+    template: Path,
+    timeout: float = IMAGE_SEARCH_TIMEOUT,
+    interval: float = IMAGE_RETRY_INTERVAL,
+) -> tuple[int, int] | None:
+    """在屏幕上尝试定位模板，找不到时返回 None，不保存调试截图。"""
+    _require_template(template)
+    deadline = time.monotonic() + timeout
+
+    while time.monotonic() < deadline:
+        try:
+            location = pyautogui.locateOnScreen(
+                str(template),
+                confidence=IMAGE_CONFIDENCE,
+            )
+            if location is not None:
+                center = pyautogui.center(location)
+                return center.x, center.y
+        except pyautogui.ImageNotFoundException:
+            pass
+        time.sleep(interval)
+    return None
+
+
 def _wait_and_locate_image(
     template: Path,
     *,
@@ -280,12 +305,31 @@ def _click(position: tuple[int, int]) -> None:
 
 
 def ensure_uu_connected() -> None:
-    """正式 UU 启动链路：启动 -> 聚焦 -> 移动 -> 等待 -> 点击。"""
+    """正式 UU 启动链路：优先复用已加速状态，否则补跑完整识图流程。"""
     _require_admin()
+    uu_was_running = _is_uu_running()
     _ensure_uu_started()
 
     title = _focus_uu_window()
     log.info("UU window focused: %s", title)
+
+    if uu_was_running:
+        log.info(
+            "UU was already running, checking %s for reusable acceleration state",
+            TPL_STEP_3.name,
+        )
+        confirm_pos = _try_locate_image(
+            TPL_STEP_3,
+            timeout=REUSE_CONFIRM_TIMEOUT,
+        )
+        if confirm_pos is not None:
+            log.info(
+                "existing acceleration confirmed at (%d, %d), skipping step 1/2",
+                confirm_pos[0],
+                confirm_pos[1],
+            )
+            return
+        log.info("existing UU session is not in accelerated state, running full startup chain")
 
     first_target = _wait_and_locate_image(
         TPL_STEP_1,
@@ -315,11 +359,6 @@ def ensure_uu_connected() -> None:
 def main() -> int:
     import argparse
 
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s [%(name)s] %(levelname)s %(message)s",
-    )
-
     parser = argparse.ArgumentParser(description="UU 加速器控制")
     parser.add_argument(
         "action",
@@ -328,7 +367,23 @@ def main() -> int:
         choices=["start", "stop"],
         help="start: 启动并验证加速; stop: 关闭 UU 进程 (default: start)",
     )
+    parser.add_argument(
+        "--log-file",
+        type=Path,
+        help="optional log file path for manual GUI test evidence",
+    )
     args = parser.parse_args()
+
+    handlers: list[logging.Handler] = [logging.StreamHandler()]
+    if args.log_file:
+        args.log_file.parent.mkdir(parents=True, exist_ok=True)
+        handlers.append(logging.FileHandler(args.log_file, encoding="utf-8"))
+
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(name)s] %(levelname)s %(message)s",
+        handlers=handlers,
+    )
 
     try:
         if args.action == "stop":
